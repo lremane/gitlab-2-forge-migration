@@ -31,20 +31,23 @@ import gitlab  # pip install python-gitlab
 import gitlab.v4.objects
 
 from pyforgejo import AuthenticatedClient
-from pyforgejo.api.admin import admin_create_public_key, admin_create_user
+from pyforgejo.api.admin import admin_create_user
 from pyforgejo.api.miscellaneous import get_version
 from pyforgejo.api.organization import org_create, org_get
 from pyforgejo.api.repository import repo_get
-from pyforgejo.api.user import user_get, user_list_keys
-from pyforgejo.models.create_key_option import CreateKeyOption
+from pyforgejo.api.user import user_get
 from pyforgejo.models.create_org_option import CreateOrgOption
 from pyforgejo.models.create_user_option import CreateUserOption
 
-from fg_migration import fg_print
+from tools.fg_migration import fg_print
 from forgejo_http import ForgejoHttp
 from tools.csv_input_reader import InputCsvReader
 from migrate_organizations import import_groups
 import tools.migration_config as cfg
+from tools.user_import import (
+    ensure_importer_user,
+    ensure_user_exists,
+)
 
 def main():
     _args = docopt(__doc__)
@@ -141,47 +144,6 @@ def get_issues(fg_http: ForgejoHttp, owner: str, repo: str) -> List:
             f"Failed to load existing issues for project {repo}! {issue_response.text}"
         )
     return existing_issues
-
-
-def get_user_keys(fg_client: AuthenticatedClient, username: str) -> Dict:
-    key_response: requests.Response = user_list_keys.sync_detailed(
-        username, client=fg_client
-    )
-    if key_response.status_code.name == "OK":
-        return json.loads(key_response.content)
-
-    status_code = key_response.status_code.name
-    fg_print.error(
-        f"Failed to load user keys for user {username}! {status_code}",
-        f"failed to load user keys for user {username}",
-    )
-    return []
-
-
-def user_exists(fg_client: AuthenticatedClient, username: str) -> bool:
-    user_response: requests.Response = user_get.sync_detailed(username, client=fg_client)
-    if user_response.status_code.name == "OK":
-        fg_print.warning(f"User {username} already exists in Forgejo, skipping!")
-        return True
-    print(f"User {username} not found in Forgejo, importing!")
-    return False
-
-
-def user_key_exists(fg_client: AuthenticatedClient, username: str, keyname: str) -> bool:
-    existing_keys = get_user_keys(fg_client, username)
-    if existing_keys:
-        existing_key = next(
-            (item for item in existing_keys if item.get("title") == keyname), None
-        )
-        if existing_key is not None:
-            fg_print.warning(
-                f"Public key {keyname} already exists for user {username}, skipping!"
-            )
-            return True
-        print(f"Public key {keyname} does not exist for user {username}, importing!")
-        return False
-    print(f"No public keys for user {username}, importing!")
-    return False
 
 
 def collaborator_exists(
@@ -329,39 +291,6 @@ def _ensure_owner_exists(
     return None
 
 
-def _ensure_user_exists_by_username(
-        fg_client: AuthenticatedClient, username: str
-) -> Optional[Dict]:
-    if not username:
-        return None
-
-    resp = user_get.sync_detailed(username, client=fg_client)
-    if resp.status_code.name == "OK":
-        return json.loads(resp.content)
-
-    rnd_str = "".join(random.choices(string.ascii_uppercase + string.digits, k=10))
-    tmp_password = f"Tmp1!{rnd_str}"
-    tmp_email = f"{username}@noemail-git.local"
-    body = CreateUserOption(
-        email=tmp_email,
-        full_name=username,
-        login_name=username,
-        password=tmp_password,
-        send_notify=False,
-        source_id=0,
-        username=username,
-    )
-    import_response = admin_create_user.sync_detailed(body=body, client=fg_client)
-    if import_response.status_code.name == "CREATED":
-        fg_print.info(f"User {username} created (needed for collaborator import), temporary password: {tmp_password}")
-        resp = user_get.sync_detailed(username, client=fg_client)
-        if resp.status_code.name == "OK":
-            return json.loads(resp.content)
-
-    msg = json.loads(import_response.content).get("message")
-    fg_print.error(f"Failed to create user {username}: {msg}", f"failed to create user {username}")
-    return None
-
 def _ensure_collaborator_with_permission(
         fg_client: AuthenticatedClient,
         fg_http: ForgejoHttp,
@@ -373,7 +302,7 @@ def _ensure_collaborator_with_permission(
     if not username:
         return
 
-    _ensure_user_exists_by_username(fg_client, username)
+    ensure_user_exists(fg_client, username, full_name=username, email=f"{username}@noemail-git.local", notify=False, reason="needed for collaborator import")
 
     if collaborator_exists(fg_http, owner, repo, username):
         return
@@ -485,6 +414,8 @@ def _import_project_issues(
     existing_milestones = get_milestones(fg_http, owner, repo)
     existing_labels = get_labels(fg_http, owner, repo)
 
+    ensure_importer_user(fg_client, notify=False)
+
     for issue in issues:
         if issue_exists(fg_http, owner, repo, issue.title):
             continue
@@ -499,8 +430,22 @@ def _import_project_issues(
         if not author_username:
             author_username = "forgejo-importer"
 
-        _ensure_user_exists_by_username(fg_client, author_username)
-        _ensure_collaborator_with_permission(fg_client, fg_http, owner, repo, author_username, permission="read")
+        ensure_user_exists(
+            fg_client,
+            author_username,
+            full_name=author_username,
+            email=f"{author_username}@noemail-git.local",
+            notify=False,
+            reason="needed for issue author",
+        )
+        _ensure_collaborator_with_permission(
+            fg_client,
+            fg_http,
+            owner,
+            repo,
+            author_username,
+            permission="read",
+        )
 
         due_date = ""
         if issue.due_date is not None:
@@ -521,12 +466,40 @@ def _import_project_issues(
             assignees = []
 
         if assignee:
-            _ensure_user_exists_by_username(fg_client, assignee)
-            _ensure_collaborator_with_permission(fg_client, fg_http, owner, repo, assignee, permission="read")
+            ensure_user_exists(
+                fg_client,
+                assignee,
+                full_name=assignee,
+                email=f"{assignee}@noemail-git.local",
+                notify=False,
+                reason="needed for issue assignee",
+            )
+            _ensure_collaborator_with_permission(
+                fg_client,
+                fg_http,
+                owner,
+                repo,
+                assignee,
+                permission="read",
+            )
 
         for u in assignees:
-            _ensure_user_exists_by_username(fg_client, u)
-            _ensure_collaborator_with_permission(fg_client, fg_http, owner, repo, u, permission="read")
+            ensure_user_exists(
+                fg_client,
+                u,
+                full_name=u,
+                email=f"{u}@noemail-git.local",
+                notify=False,
+                reason="needed for issue assignees",
+            )
+            _ensure_collaborator_with_permission(
+                fg_client,
+                fg_http,
+                owner,
+                repo,
+                u,
+                permission="read",
+            )
 
         milestone = None
         if issue.milestone is not None and isinstance(issue.milestone, dict):
@@ -579,9 +552,14 @@ def _import_project_issues(
                 sudo=author_username,
             )
             if import_response_2.ok:
-                fg_print.warning(f"Issue {issue.title} imported as {author_username}, but assignees were dropped due to Forgejo validation.")
+                fg_print.warning(
+                    f"Issue {issue.title} imported as {author_username}, but assignees were dropped due to Forgejo validation."
+                )
             else:
-                fg_print.error(f"Issue {issue.title} import failed: {import_response_2.text}", f"failed to import issue {issue.title}")
+                fg_print.error(
+                    f"Issue {issue.title} import failed: {import_response_2.text}",
+                    f"failed to import issue {issue.title}",
+                )
             continue
 
         fg_print.error(f"Issue {issue.title} import failed: {txt}", f"failed to import issue {issue.title}")
@@ -660,7 +638,6 @@ def _import_project_repo(
                 continue
 
         except requests.exceptions.RequestException as e:
-            last_err = e
             fg_print.error(
                 f"Project {proj_name} import request failed: {type(e).__name__}: {e}",
                 f"project {proj_name} import request failed",
@@ -684,7 +661,15 @@ def _import_project_repo_collaborators(
         if not collaborator.username:
             continue
 
-        _ensure_user_exists_by_username(fg_client, collaborator.username)
+        ensure_user_exists(
+            fg_client,
+            collaborator.username,
+            full_name=collaborator.username,
+            email=f"{collaborator.username}@noemail-git.local",
+            notify=False,
+            reason="needed for collaborator import",
+        )
+
 
         if not collaborator_exists(
                 fg_http, forgejo_owner, forgejo_repo, collaborator.username
@@ -715,93 +700,17 @@ def _import_project_repo_collaborators(
 
 
 def _import_users(
-        fg_client: AuthenticatedClient, users: List[gitlab.v4.objects.User], notify: bool = False
-):
-    if not user_exists(fg_client, "forgejo-importer"):
-        rnd_str = "".join(random.choices(string.ascii_uppercase + string.digits, k=10))
-        tmp_password = f"Tmp1!{rnd_str}"
-        body = CreateUserOption(
-            email="forgejo-importer@noemail-git.local",
-            full_name="forgejo-importer",
-            login_name="forgejo-importer",
-            password=tmp_password,
-            send_notify=False,
-            source_id=0,
-            username="forgejo-importer",
-        )
-        import_response: requests.Response = admin_create_user.sync_detailed(
-            body=body, client=fg_client
-        )
-        if import_response.status_code.name == "CREATED":
-            fg_print.info(f"User forgejo-importer imported, temporary password: {tmp_password}")
-        else:
-            msg = json.loads(import_response.content).get("message")
-            fg_print.error(f"User forgejo-importer import failed: {msg}")
-
-    for user in users:
-        keys: List[gitlab.v4.objects.UserKey] = user.keys.list(all=True)
-
-        print(f"Importing user {user.username}...")
-        print(f"Found {len(keys)} public keys for user {user.username}")
-
-        if not user_exists(fg_client, user.username):
-            rnd_str = "".join(
-                random.choices(string.ascii_uppercase + string.digits, k=10)
-            )
-            tmp_password = f"Tmp1!{rnd_str}"
-            tmp_email = f"{user.username}@noemail-git.local"
-            try:
-                tmp_email = user.email
-            except AttributeError:
-                pass
-            body = CreateUserOption(
-                email=tmp_email,
-                full_name=user.name,
-                login_name=user.username,
-                password=tmp_password,
-                send_notify=notify,
-                source_id=0,
-                username=user.username,
-            )
-            import_response = admin_create_user.sync_detailed(body=body, client=fg_client)
-            if import_response.status_code.name == "CREATED":
-                fg_print.info(
-                    f"User {user.username} imported, temporary password: {tmp_password}"
-                )
-            else:
-                msg = json.loads(import_response.content).get("message")
-                fg_print.error(
-                    f"User {user.username} import failed: {msg}",
-                    f"failed to import user {user.username}",
-                )
-
-        _import_user_keys(fg_client, keys, user)
-
-
-def _import_user_keys(
+        gitlab_api: gitlab.Gitlab,
         fg_client: AuthenticatedClient,
-        keys: List[gitlab.v4.objects.UserKey],
-        user: gitlab.v4.objects.User,
+        users: List[gitlab.v4.objects.User],
+        notify: bool = False,
 ):
-    for key in keys:
-        if not user_key_exists(fg_client, user.username, key.title):
-            import_response: requests.Response = admin_create_public_key.sync_detailed(
-                username=user.username,
-                body=CreateKeyOption(
-                    key=key.key,
-                    read_only=True,
-                    title=key.title,
-                ),
-                client=fg_client,
-            )
-            if import_response.status_code.name == "CREATED":
-                fg_print.info(f"Public key {key.title} imported!")
-            else:
-                msg = json.loads(import_response.content).get("message")
-                fg_print.error(
-                    f"Public key {key.title} import failed: {msg}",
-                    f"failed to import key {key.title} for user {user.username}",
-                )
+    from tools.user_import import ensure_importer_user, import_one_gitlab_user
+
+    ensure_importer_user(fg_client, notify=False)
+
+    for u in users:
+        import_one_gitlab_user(gitlab_api, fg_client, u, notify=notify)
 
 
 def import_users(gitlab_api: gitlab.Gitlab, fg_client: AuthenticatedClient, notify=False):
@@ -813,7 +722,7 @@ def import_users(gitlab_api: gitlab.Gitlab, fg_client: AuthenticatedClient, noti
         count += 1
         if count % 50 == 0:
             print(f"Fetched {count} users...")
-        _import_users(fg_client, [user], notify)
+        _import_users(gitlab_api, fg_client, [user], notify)
 
     print(f"Done. Processed {count} users.")
 

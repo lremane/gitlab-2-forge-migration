@@ -13,7 +13,7 @@ from pyforgejo.api.user import user_get
 from pyforgejo.models.create_org_option import CreateOrgOption
 from pyforgejo.models.create_user_option import CreateUserOption
 
-from fg_migration import fg_print
+from tools.fg_migration import fg_print
 from forgejo_http import ForgejoHttp
 
 
