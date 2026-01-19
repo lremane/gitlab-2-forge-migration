@@ -1,10 +1,8 @@
 # Gitlab to Forgejo migration script
 ## Usage by Laurin
-1. Pull all repos: `./get_repos.py`
-2. Migrate Groups `./migrate.py --groups --migrate-from-csv=migrate_repos.csv`
-3. Migrate Projects `./migrate.py --projects --migrate-from-csv=migrate_repos.csv`
-
-
+1. Pull all repos: `python get_repos.py`
+2. Migrate Groups `python migrate.py --groups`
+3. Migrate Projects `python migrate.py --projects --migrate-from-csv=migrate_repos.csv`
 
 
 ## --== WIP ==--

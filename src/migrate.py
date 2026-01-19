@@ -19,7 +19,6 @@ import json
 import re
 import random
 import string
-import configparser
 from typing import Dict
 from typing import List
 from typing import Optional
@@ -45,31 +44,7 @@ from fg_migration import fg_print
 from forgejo_http import ForgejoHttp
 from tools.csv_input_reader import InputCsvReader
 from migrate_organizations import import_groups
-
-SCRIPT_VERSION = "0.9"
-
-#######################
-# CONFIG SECTION START
-#######################
-if not os.path.exists("../.migrate.ini"):
-    print("Please create .migrate.ini as explained in the README!")
-    os.sys.exit()
-
-config = configparser.RawConfigParser()
-config.read("../.migrate.ini")
-GITLAB_URL = config.get("migrate", "gitlab_url")
-GITLAB_TOKEN = config.get("migrate", "gitlab_token")
-GITLAB_ADMIN_USER = config.get("migrate", "gitlab_admin_user")
-GITLAB_ADMIN_PASS = config.get("migrate", "gitlab_admin_pass")
-FORGEJO_URL = config.get("migrate", "forgejo_url")
-FORGEJO_API_URL = f"{FORGEJO_URL}/api/v1"
-FORGEJO_TOKEN = config.get("migrate", "forgejo_token")
-FORGEJO_USER = config.get("migrate", "forgejo_admin_user")
-FORGEJO_PASSWORD = config.get("migrate", "forgejo_admin_pass")
-#######################
-# CONFIG SECTION END
-#######################
-
+import tools.migration_config as cfg
 
 def main():
     _args = docopt(__doc__)
@@ -78,19 +53,18 @@ def main():
     fg_print.print_color(
         fg_print.Bcolors.HEADER, "---=== Gitlab to Forgejo migration ===---"
     )
-    print(f"Version: {SCRIPT_VERSION}")
     print()
 
-    gl = gitlab.Gitlab(GITLAB_URL, private_token=GITLAB_TOKEN)
+    gl = gitlab.Gitlab(cfg.GITLAB_URL, private_token=cfg.GITLAB_TOKEN)
     gl.auth()
     assert isinstance(gl.user, gitlab.v4.objects.CurrentUser)
     fg_print.info(f"Connected to Gitlab, version: {gl.version()[0]}")
 
-    fg_client = AuthenticatedClient(base_url=FORGEJO_API_URL, token=FORGEJO_TOKEN)
+    fg_client = AuthenticatedClient(base_url=cfg.FORGEJO_API_URL, token=cfg.FORGEJO_TOKEN)
     fg_ver = json.loads(get_version.sync_detailed(client=fg_client).content)["version"]
     fg_print.info(f"Connected to Forgejo, version: {fg_ver}")
 
-    fg_http = ForgejoHttp(FORGEJO_API_URL, FORGEJO_TOKEN)
+    fg_http = ForgejoHttp(cfg.FORGEJO_API_URL, cfg.FORGEJO_TOKEN)
 
     try:
         if args["users"] or args["all"]:
@@ -634,7 +608,7 @@ def _import_project_repo(
         "description": project.description or "",
         "private": private,
         "uid": owner_obj["id"],
-        "auth_token": GITLAB_TOKEN,
+        "auth_token": cfg.GITLAB_TOKEN,
         "issues": True,
         "labels": True,
         "milestones": True,
@@ -861,7 +835,7 @@ def import_projects(
 
 
 def _load_projects_from_csv(gitlab_api: gitlab.Gitlab, csv_path: str) -> List[gitlab.v4.objects.Project]:
-    reader = InputCsvReader(GITLAB_URL)
+    reader = InputCsvReader(cfg.GITLAB_URL)
 
     try:
         projects = reader.load_projects(
