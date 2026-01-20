@@ -220,7 +220,6 @@ def import_one_gitlab_user(
         reason="import from gitlab",
     )
 
-    keys: List[gitlab.v4.objects.UserKey] = []
     try:
         keys = user_full.keys.list(all=True)
     except Exception as e:
