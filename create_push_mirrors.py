@@ -22,7 +22,7 @@ import configparser
 import gitlab
 import requests
 from docopt import docopt
-from src.fg_migration import fg_print
+from src.tools.fg_migration import fg_print
 
 #######################
 # CONFIG SECTION START

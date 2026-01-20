@@ -19,15 +19,13 @@ import json
 import re
 import random
 import string
-from typing import Dict
-from typing import List
-from typing import Optional
+from typing import Dict, List, Optional
 
 from docopt import docopt
 import requests
 import dateutil.parser
 
-import gitlab  # pip install python-gitlab
+import gitlab
 import gitlab.v4.objects
 
 from pyforgejo import AuthenticatedClient
@@ -44,10 +42,9 @@ from forgejo_http import ForgejoHttp
 from tools.csv_input_reader import InputCsvReader
 from migrate_organizations import import_groups
 import tools.migration_config as cfg
-from tools.user_import import (
-    ensure_importer_user,
-    ensure_user_exists,
-)
+from tools.user_import import ensure_importer_user, ensure_user_exists, gitlab_email_for_username, \
+    gitlab_email_for_user_id
+
 
 def main():
     _args = docopt(__doc__)
@@ -229,7 +226,9 @@ def issue_exists(fg_http: ForgejoHttp, owner: str, repo: str, issue: str) -> boo
 
 
 def _ensure_owner_exists(
-        fg_client: AuthenticatedClient, project: gitlab.v4.objects.Project
+        gitlab_api: gitlab.Gitlab,
+        fg_client: AuthenticatedClient,
+        project: gitlab.v4.objects.Project
 ) -> Optional[Dict]:
     ns = project.namespace or {}
     ns_path = ns.get("path") or ns.get("name") or ""
@@ -270,7 +269,9 @@ def _ensure_owner_exists(
 
     rnd_str = "".join(random.choices(string.ascii_uppercase + string.digits, k=10))
     tmp_password = f"Tmp1!{rnd_str}"
-    tmp_email = f"{ns_path}@noemail-git.local"
+    gl_email = gitlab_email_for_username(gitlab_api, ns_path)
+    tmp_email = (gl_email or "").strip() or f"{ns_path}@noemail-git.local"
+
     body = CreateUserOption(
         email=tmp_email,
         full_name=ns_name,
@@ -292,6 +293,7 @@ def _ensure_owner_exists(
 
 
 def _ensure_collaborator_with_permission(
+        gitlab_api: gitlab.Gitlab,
         fg_client: AuthenticatedClient,
         fg_http: ForgejoHttp,
         owner: str,
@@ -302,7 +304,15 @@ def _ensure_collaborator_with_permission(
     if not username:
         return
 
-    ensure_user_exists(fg_client, username, full_name=username, email=f"{username}@noemail-git.local", notify=False, reason="needed for collaborator import")
+    gl_email = gitlab_email_for_username(gitlab_api, username)
+    ensure_user_exists(
+        fg_client,
+        username,
+        full_name=username,
+        email=(gl_email or "").strip() or f"{username}@noemail-git.local",
+        notify=False,
+        reason="needed for collaborator import",
+    )
 
     if collaborator_exists(fg_http, owner, repo, username):
         return
@@ -310,6 +320,7 @@ def _ensure_collaborator_with_permission(
     import_response: requests.Response = fg_http.put(
         f"/repos/{owner}/{repo}/collaborators/{username}",
         json={"permission": permission},
+        sudo=owner,
     )
     if import_response.ok:
         fg_print.info(f"Collaborator {username} added to {owner}/{repo} (needed for issue author/assignee)!")
@@ -319,8 +330,9 @@ def _ensure_collaborator_with_permission(
             f"failed to add collaborator {username} to {owner}/{repo}",
         )
 
-def get_user_or_group(fg_client: AuthenticatedClient, project: gitlab.v4.objects.Project) -> Optional[Dict]:
-    owner = _ensure_owner_exists(fg_client, project)
+
+def get_user_or_group(gitlab_api: gitlab.Gitlab, fg_client: AuthenticatedClient, project: gitlab.v4.objects.Project) -> Optional[Dict]:
+    owner = _ensure_owner_exists(gitlab_api, fg_client, project)
     if owner is None:
         ns = project.namespace or {}
         ns_path = ns.get("path") or ns.get("name") or ""
@@ -347,6 +359,7 @@ def _import_project_labels(
                     "color": label.color,
                     "description": label.description,
                 },
+                sudo=owner,
             )
             if import_response.ok:
                 fg_print.info(f"Label {label.name} imported!")
@@ -377,6 +390,7 @@ def _import_project_milestones(
                     "due_on": due_date,
                     "title": milestone.title,
                 },
+                sudo=owner,
             )
             if import_response.ok:
                 fg_print.info(f"Milestone {milestone.title} imported!")
@@ -391,6 +405,7 @@ def _import_project_milestones(
                             "title": milestone.title,
                             "state": milestone.state,
                         },
+                        sudo=owner,
                     )
                     if update_response.ok:
                         fg_print.info(f"Milestone {milestone.title} updated!")
@@ -405,6 +420,7 @@ def _import_project_milestones(
 
 
 def _import_project_issues(
+        gitlab_api: gitlab.Gitlab,
         fg_client: AuthenticatedClient,
         fg_http: ForgejoHttp,
         issues: List[gitlab.v4.objects.ProjectIssue],
@@ -421,24 +437,35 @@ def _import_project_issues(
             continue
 
         author_username = None
+        author_id = None
         try:
             if getattr(issue, "author", None) and isinstance(issue.author, dict):
                 author_username = (issue.author.get("username") or "").strip() or None
+                author_id = issue.author.get("id")
         except Exception:
             author_username = None
+            author_id = None
 
         if not author_username:
             author_username = "forgejo-importer"
+
+        author_email = None
+        if author_username != "forgejo-importer":
+            if isinstance(author_id, int):
+                author_email = gitlab_email_for_user_id(gitlab_api, author_id)
+            if not author_email:
+                author_email = gitlab_email_for_username(gitlab_api, author_username)
 
         ensure_user_exists(
             fg_client,
             author_username,
             full_name=author_username,
-            email=f"{author_username}@noemail-git.local",
+            email=(author_email or "").strip() or f"{author_username}@noemail-git.local",
             notify=False,
             reason="needed for issue author",
         )
         _ensure_collaborator_with_permission(
+            gitlab_api,
             fg_client,
             fg_http,
             owner,
@@ -452,29 +479,42 @@ def _import_project_issues(
             due_date = dateutil.parser.parse(issue.due_date).strftime("%Y-%m-%dT%H:%M:%SZ")
 
         assignee = None
+        assignee_id = None
         if issue.assignee is not None and isinstance(issue.assignee, dict):
             assignee = (issue.assignee.get("username") or "").strip() or None
+            assignee_id = issue.assignee.get("id")
 
         assignees: List[str] = []
+        assignees_ids: Dict[str, Optional[int]] = {}
         try:
             for tmp_assignee in getattr(issue, "assignees", []) or []:
                 if isinstance(tmp_assignee, dict):
                     u = (tmp_assignee.get("username") or "").strip()
                     if u:
                         assignees.append(u)
+                        tid = tmp_assignee.get("id")
+                        assignees_ids[u] = tid if isinstance(tid, int) else None
         except Exception:
             assignees = []
+            assignees_ids = {}
 
         if assignee:
+            assignee_email = None
+            if isinstance(assignee_id, int):
+                assignee_email = gitlab_email_for_user_id(gitlab_api, assignee_id)
+            if not assignee_email:
+                assignee_email = gitlab_email_for_username(gitlab_api, assignee)
+
             ensure_user_exists(
                 fg_client,
                 assignee,
                 full_name=assignee,
-                email=f"{assignee}@noemail-git.local",
+                email=(assignee_email or "").strip() or f"{assignee}@noemail-git.local",
                 notify=False,
                 reason="needed for issue assignee",
             )
             _ensure_collaborator_with_permission(
+                gitlab_api,
                 fg_client,
                 fg_http,
                 owner,
@@ -484,15 +524,23 @@ def _import_project_issues(
             )
 
         for u in assignees:
+            uid = assignees_ids.get(u)
+            u_email = None
+            if isinstance(uid, int):
+                u_email = gitlab_email_for_user_id(gitlab_api, uid)
+            if not u_email:
+                u_email = gitlab_email_for_username(gitlab_api, u)
+
             ensure_user_exists(
                 fg_client,
                 u,
                 full_name=u,
-                email=f"{u}@noemail-git.local",
+                email=(u_email or "").strip() or f"{u}@noemail-git.local",
                 notify=False,
                 reason="needed for issue assignees",
             )
             _ensure_collaborator_with_permission(
+                gitlab_api,
                 fg_client,
                 fg_http,
                 owner,
@@ -602,7 +650,12 @@ def _import_project_repo(
 
     for attempt in range(1, attempts + 1):
         try:
-            resp = fg_http.post("/repos/migrate", json=payload, timeout=timeout_seconds)
+            resp = fg_http.post(
+                "/repos/migrate",
+                json=payload,
+                timeout=timeout_seconds,
+                sudo=forgejo_owner,
+            )
             if resp.ok:
                 fg_print.info(f"Project {proj_name} imported (GitLab importer)!")
                 return
@@ -651,6 +704,7 @@ def _import_project_repo(
 
 
 def _import_project_repo_collaborators(
+        gitlab_api: gitlab.Gitlab,
         fg_client: AuthenticatedClient,
         fg_http: ForgejoHttp,
         forgejo_owner: str,
@@ -658,21 +712,28 @@ def _import_project_repo_collaborators(
         collaborators: List[gitlab.v4.objects.ProjectMember],
 ):
     for collaborator in collaborators:
-        if not collaborator.username:
+        username = (getattr(collaborator, "username", "") or "").strip()
+        if not username:
             continue
+
+        gl_email = None
+        uid = getattr(collaborator, "id", None)
+        if isinstance(uid, int):
+            gl_email = gitlab_email_for_user_id(gitlab_api, uid)
+        if not gl_email:
+            gl_email = gitlab_email_for_username(gitlab_api, username)
 
         ensure_user_exists(
             fg_client,
-            collaborator.username,
-            full_name=collaborator.username,
-            email=f"{collaborator.username}@noemail-git.local",
+            username,
+            full_name=username,
+            email=(gl_email or "").strip() or f"{username}@noemail-git.local",
             notify=False,
             reason="needed for collaborator import",
         )
 
-
         if not collaborator_exists(
-                fg_http, forgejo_owner, forgejo_repo, collaborator.username
+                fg_http, forgejo_owner, forgejo_repo, username
         ):
             permission = "read"
             if collaborator.access_level in (10, 20):
@@ -687,15 +748,16 @@ def _import_project_repo_collaborators(
                 )
 
             import_response: requests.Response = fg_http.put(
-                f"/repos/{forgejo_owner}/{forgejo_repo}/collaborators/{collaborator.username}",
+                f"/repos/{forgejo_owner}/{forgejo_repo}/collaborators/{username}",
                 json={"permission": permission},
+                sudo=forgejo_owner,
             )
             if import_response.ok:
-                fg_print.info(f"Collaborator {collaborator.username} imported!")
+                fg_print.info(f"Collaborator {username} imported!")
             else:
                 fg_print.error(
-                    f"Collaborator {collaborator.username} import failed: {import_response.text}",
-                    f"failed to import collaborator {collaborator.username} for {forgejo_owner}/{forgejo_repo}",
+                    f"Collaborator {username} import failed: {import_response.text}",
+                    f"failed to import collaborator {username} for {forgejo_owner}/{forgejo_repo}",
                 )
 
 
@@ -706,9 +768,7 @@ def _import_users(
         notify: bool = False,
 ):
     from tools.user_import import ensure_importer_user, import_one_gitlab_user
-
     ensure_importer_user(fg_client, notify=False)
-
     for u in users:
         import_one_gitlab_user(gitlab_api, fg_client, u, notify=notify)
 
@@ -740,7 +800,7 @@ def import_projects(
         eligible = _load_eligible_membership_projects(gitlab_api, min_access_level)
 
     for idx, project in enumerate(eligible, start=1):
-        _import_one_project_full(fg_client, fg_http, project, idx, len(eligible))
+        _import_one_project_full(gitlab_api, fg_client, fg_http, project, idx, len(eligible))
 
 
 def _load_projects_from_csv(gitlab_api: gitlab.Gitlab, csv_path: str) -> List[gitlab.v4.objects.Project]:
@@ -835,6 +895,7 @@ def _extract_access_level(project: gitlab.v4.objects.Project) -> int:
 
 
 def _import_one_project_full(
+        gitlab_api: gitlab.Gitlab,
         fg_client: AuthenticatedClient,
         fg_http: ForgejoHttp,
         project: gitlab.v4.objects.Project,
@@ -857,7 +918,7 @@ def _import_one_project_full(
     print(f"Found {len(data['milestones'])} milestones for project {clean_repo}", flush=True)
     print(f"Found {len(data['issues'])} issues for project {clean_repo}", flush=True)
 
-    owner_obj = get_user_or_group(fg_client, project)
+    owner_obj = get_user_or_group(gitlab_api, fg_client, project)
     if not owner_obj:
         fg_print.error(
             f"Failed to load project owner for project {clean_repo}",
@@ -871,11 +932,11 @@ def _import_one_project_full(
     _import_project_repo(fg_client, fg_http, project, owner_obj)
 
     _import_project_repo_collaborators(
-        fg_client, fg_http, forgejo_owner, forgejo_repo, data["collaborators"]
+        gitlab_api, fg_client, fg_http, forgejo_owner, forgejo_repo, data["collaborators"]
     )
     _import_project_labels(fg_http, data["labels"], forgejo_owner, forgejo_repo)
     _import_project_milestones(fg_http, data["milestones"], forgejo_owner, forgejo_repo)
-    _import_project_issues(fg_client, fg_http, data["issues"], forgejo_owner, forgejo_repo)
+    _import_project_issues(gitlab_api, fg_client, fg_http, data["issues"], forgejo_owner, forgejo_repo)
 
 
 def _load_project_gitlab_data(

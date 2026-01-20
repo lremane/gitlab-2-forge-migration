@@ -1,20 +1,18 @@
 import json
 import re
-from typing import List
+from typing import List, Optional
 
 import requests
 import gitlab
 import gitlab.v4.objects
 
 from pyforgejo import AuthenticatedClient
-from pyforgejo.api.admin import admin_create_user
 from pyforgejo.api.organization import org_create, org_get, org_list_teams
-from pyforgejo.api.user import user_get
 from pyforgejo.models.create_org_option import CreateOrgOption
-from pyforgejo.models.create_user_option import CreateUserOption
 
 from tools.fg_migration import fg_print
 from forgejo_http import ForgejoHttp
+from tools.user_import import ensure_user_exists, gitlab_email_for_user_id, gitlab_email_for_username
 
 
 def name_clean(name: str) -> str:
@@ -61,32 +59,20 @@ def member_exists(fg_http: ForgejoHttp, username: str, teamid: int) -> bool:
     return False
 
 
-def _ensure_user_exists_by_username(fg_client: AuthenticatedClient, username: str) -> bool:
-    if not username:
-        return False
+def _resolve_gitlab_member_email(gitlab_api: gitlab.Gitlab, member: object) -> Optional[str]:
+    uid = getattr(member, "id", None)
+    if isinstance(uid, int):
+        em = gitlab_email_for_user_id(gitlab_api, uid)
+        if em:
+            return em.strip()
 
-    resp: requests.Response = user_get.sync_detailed(username, client=fg_client)
-    if resp.status_code.name == "OK":
-        return True
+    username = (getattr(member, "username", "") or "").strip()
+    if username:
+        em = gitlab_email_for_username(gitlab_api, username)
+        if em:
+            return em.strip()
 
-    tmp_email = f"{username}@noemail-git.local"
-    body = CreateUserOption(
-        email=tmp_email,
-        full_name=username,
-        login_name=username,
-        password="Tmp1!ChangeMe12345",
-        send_notify=False,
-        source_id=0,
-        username=username,
-    )
-    create_resp: requests.Response = admin_create_user.sync_detailed(body=body, client=fg_client)
-    if create_resp.status_code.name == "CREATED":
-        fg_print.info(f"User {username} created (needed for org membership import)")
-        return True
-
-    msg = json.loads(create_resp.content).get("message")
-    fg_print.error(f"Failed to create user {username}: {msg}", f"failed to create user {username}")
-    return False
+    return None
 
 
 def _import_group_members(
@@ -110,23 +96,33 @@ def _import_group_members(
     print(f"Organization teams fetched, importing users to first team: {first_team_name}")
 
     for member in members:
-        if not member.username:
+        username = (getattr(member, "username", "") or "").strip()
+        if not username:
             continue
 
-        if not _ensure_user_exists_by_username(fg_client, member.username):
+        email = _resolve_gitlab_member_email(gitlab_api, member) or f"{username}@noemail-git.local"
+        u_obj, _ = ensure_user_exists(
+            fg_client,
+            username,
+            full_name=username,
+            email=email,
+            notify=False,
+            reason="needed for org membership import",
+        )
+        if not u_obj:
             continue
 
-        if not member_exists(fg_http, member.username, team_id):
+        if not member_exists(fg_http, username, team_id):
             resp: requests.Response = fg_http.put(
-                f"/teams/{team_id}/members/{member.username}",
+                f"/teams/{team_id}/members/{username}",
                 timeout=10,
             )
             if resp.ok:
-                fg_print.info(f"Member {member.username} added to group {clean_group_name}!")
+                fg_print.info(f"Member {username} added to group {clean_group_name}!")
             else:
                 fg_print.error(
-                    f"Failed to add member {member.username} to group {clean_group_name}! {resp.status_code} {resp.text}",
-                    f"failed to add member {member.username} to group {clean_group_name}",
+                    f"Failed to add member {username} to group {clean_group_name}! {resp.status_code} {resp.text}",
+                    f"failed to add member {username} to group {clean_group_name}",
                 )
 
 

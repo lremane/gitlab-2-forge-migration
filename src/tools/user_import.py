@@ -1,6 +1,7 @@
 import json
 import random
 import string
+from functools import lru_cache
 from typing import Dict, List, Optional, Tuple
 
 import requests
@@ -15,6 +16,46 @@ from pyforgejo.models.create_user_option import CreateUserOption
 
 from .fg_migration import fg_print
 
+@lru_cache(maxsize=10000)
+def gitlab_email_for_user_id(gitlab_api: gitlab.Gitlab, user_id: int) -> Optional[str]:
+    try:
+        u = gitlab_api.users.get(user_id)
+    except Exception:
+        return None
+
+    for attr in ("email", "public_email"):
+        v = getattr(u, attr, None)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
+
+@lru_cache(maxsize=10000)
+def gitlab_email_for_username(gitlab_api: gitlab.Gitlab, username: str) -> Optional[str]:
+    username = (username or "").strip()
+    if not username:
+        return None
+
+    try:
+        users = gitlab_api.users.list(username=username)
+        if users:
+            uid = getattr(users[0], "id", None)
+            if isinstance(uid, int):
+                return gitlab_email_for_user_id(gitlab_api, uid)
+    except Exception:
+        pass
+
+    try:
+        users = gitlab_api.users.list(search=username)
+        for u in users or []:
+            if (getattr(u, "username", "") or "").strip() == username:
+                uid = getattr(u, "id", None)
+                if isinstance(uid, int):
+                    return gitlab_email_for_user_id(gitlab_api, uid)
+    except Exception:
+        pass
+
+    return None
 
 def get_user_keys(fg_client: AuthenticatedClient, username: str) -> List[Dict]:
     key_response: requests.Response = user_list_keys.sync_detailed(username, client=fg_client)
