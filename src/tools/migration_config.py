@@ -18,5 +18,8 @@ GITLAB_ADMIN_PASS = config.get("migrate", "gitlab_admin_pass")
 FORGEJO_URL = config.get("migrate", "forgejo_url")
 FORGEJO_API_URL = f"{FORGEJO_URL}/api/v1"
 FORGEJO_TOKEN = config.get("migrate", "forgejo_token")
-FORGEJO_USER = config.get("migrate", "forgejo_admin_user")
-FORGEJO_PASSWORD = config.get("migrate", "forgejo_admin_pass")
+
+FORGEJO_ADMIN_USER = config.get("migrate", "forgejo_admin_user")
+FORGEJO_ADMIN_PASS = config.get("migrate", "forgejo_admin_pass")
+
+FORGEJO_SUDO_USER = FORGEJO_ADMIN_USER

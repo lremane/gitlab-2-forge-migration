@@ -77,6 +77,7 @@ To migrate users, groups, and repositories from GitLab to Forgejo:
 
 1. Pull all repositories from GitLab:
 ```bash
+cd src/
 python get_repos.py
 ```
 
@@ -87,7 +88,7 @@ python migrate.py --groups
 
 3. Migrate projects and corresponding users:
 ```bash
-python migrate.py --projects --migrate-from-csv=migrate_repos.csv
+python migrate.py --projects --migrate-from-csv=../gitlab_repos.csv
 ```
 ### Creating Push Mirrors Back to GitLab
 If you want to create push mirrors back to GitLab:

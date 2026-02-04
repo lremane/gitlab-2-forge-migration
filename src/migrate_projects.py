@@ -266,7 +266,8 @@ def _ensure_collaborator_with_permission(
     import_response: requests.Response = fg_http.put(
         f"/repos/{owner}/{repo}/collaborators/{username}",
         json={"permission": permission},
-        sudo=owner,
+        sudo=_sudo_user_for_calls({"type": "User"})
+,
     )
     if import_response.ok:
         fg_print.info(
@@ -311,7 +312,8 @@ def _import_project_labels(
                     "color": label.color,
                     "description": label.description,
                 },
-                sudo=owner,
+                sudo=_sudo_user_for_calls({"type": "User"})
+,
             )
             if import_response.ok:
                 fg_print.info(f"Label {label.name} imported!")
@@ -340,7 +342,8 @@ def _import_project_milestones(
                     "due_on": due_date,
                     "title": milestone.title,
                 },
-                sudo=owner,
+                sudo=_sudo_user_for_calls({"type": "User"})
+,
             )
             if import_response.ok:
                 fg_print.info(f"Milestone {milestone.title} imported!")
@@ -355,7 +358,8 @@ def _import_project_milestones(
                             "title": milestone.title,
                             "state": milestone.state,
                         },
-                        sudo=owner,
+                        sudo=_sudo_user_for_calls({"type": "User"})
+,
                     )
                     if update_response.ok:
                         fg_print.info(f"Milestone {milestone.title} updated!")
@@ -539,7 +543,7 @@ def _import_project_issues(
         import_response: requests.Response = fg_http.post(
             f"/repos/{owner}/{repo}/issues",
             json=payload,
-            sudo=author_username,
+            sudo=_sudo_user_for_calls({"type": "User"}),
         )
 
         if import_response.ok:
@@ -555,7 +559,7 @@ def _import_project_issues(
             import_response_2: requests.Response = fg_http.post(
                 f"/repos/{owner}/{repo}/issues",
                 json=payload_fallback,
-                sudo=author_username,
+                sudo=_sudo_user_for_calls({"type": "User"}),
             )
             if import_response_2.ok:
                 fg_print.warning(
@@ -573,18 +577,34 @@ def _import_project_issues(
             f"failed to import issue {issue.title}",
         )
 
+def _is_forgejo_org(owner_obj: Dict) -> bool:
+    t = owner_obj.get("type")
+    if isinstance(t, str) and t.lower() == "organization":
+        return True
+    if "login_name" in owner_obj and "email" not in owner_obj:
+        return True
+    if owner_obj.get("is_organization") is True:
+        return True
+    return False
+
+
+def _sudo_user_for_calls(owner_obj: Dict) -> Optional[str]:
+    su = getattr(cfg, "FORGEJO_SUDO_USER", None)
+    if isinstance(su, str) and su.strip():
+        return su.strip()
+    return None
 
 def _import_project_repo(
         fg_client: AuthenticatedClient,
         fg_http: ForgejoHttp,
         project: gitlab.v4.objects.Project,
         owner_obj: Dict,
-):
+) -> bool:
     forgejo_owner = _forgejo_owner_name(owner_obj)
     proj_name = name_clean(project.name)
 
     if repo_exists(fg_client, forgejo_owner, proj_name):
-        return
+        return True
 
     private = project.visibility in ("private", "internal")
 
@@ -609,23 +629,28 @@ def _import_project_repo(
     attempts = 3
     last_err: Exception | None = None
 
+    sudo_user = _sudo_user_for_calls(owner_obj)
+    if _is_forgejo_org(owner_obj):
+        sudo_user = sudo_user
+
     for attempt in range(1, attempts + 1):
         try:
             resp = fg_http.post(
                 "/repos/migrate",
                 json=payload,
                 timeout=timeout_seconds,
-                sudo=forgejo_owner,
+                sudo=_sudo_user_for_calls({"type": "User"}),
             )
+
             if resp.ok:
                 fg_print.info(f"Project {proj_name} imported (GitLab importer)!")
-                return
+                return True
 
             fg_print.error(
                 f"Project {proj_name} import failed: {resp.status_code} {resp.text}",
                 f"project {proj_name} import failed",
             )
-            return
+            return False
 
         except requests.exceptions.ReadTimeout as e:
             last_err = e
@@ -638,7 +663,7 @@ def _import_project_repo(
                     fg_print.warning(
                         f"Project {proj_name} migrate request timed out, but repo now exists in Forgejo (migration likely finished)."
                     )
-                    return
+                    return True
             except Exception:
                 pass
 
@@ -648,7 +673,6 @@ def _import_project_repo(
                     f"Project {proj_name} migrate request timed out (attempt {attempt}/{attempts}); retrying after {backoff_seconds}s."
                 )
                 import time
-
                 time.sleep(backoff_seconds)
                 continue
 
@@ -657,12 +681,13 @@ def _import_project_repo(
                 f"Project {proj_name} import request failed: {type(e).__name__}: {e}",
                 f"project {proj_name} import request failed",
             )
-            return
+            return False
 
     fg_print.error(
         f"Project {proj_name} import failed after {attempts} attempts due to timeouts: {last_err}",
         f"project {proj_name} import timed out",
     )
+    return False
 
 
 def _import_project_repo_collaborators(
@@ -710,7 +735,7 @@ def _import_project_repo_collaborators(
             import_response: requests.Response = fg_http.put(
                 f"/repos/{forgejo_owner}/{forgejo_repo}/collaborators/{username}",
                 json={"permission": permission},
-                sudo=forgejo_owner,
+                sudo=_sudo_user_for_calls({"type": "User"}),
             )
             if import_response.ok:
                 fg_print.info(f"Collaborator {username} imported!")
@@ -871,7 +896,13 @@ def _import_one_project_full(
     forgejo_owner = _forgejo_owner_name(owner_obj)
     forgejo_repo = clean_repo
 
-    _import_project_repo(fg_client, fg_http, project, owner_obj)
+    ok = _import_project_repo(fg_client, fg_http, project, owner_obj)
+    if not ok:
+        fg_print.error(
+            f"Skipping labels/milestones/issues/collaborators because repo {forgejo_owner}/{forgejo_repo} was not created.",
+            f"project {forgejo_repo} skipped after import failure",
+        )
+        return
 
     _import_project_repo_collaborators(
         gitlab_api, fg_client, fg_http, forgejo_owner, forgejo_repo, data["collaborators"]
