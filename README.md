@@ -1,4 +1,4 @@
-# GitLab to Forgejo Migration Script
+# GitLab to Forgejo Migration Scripts
 
 > ⚠️ **Status:** The scripts are currently undergoing testing.
 
